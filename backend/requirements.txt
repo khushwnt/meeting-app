@@ -1,0 +1,31 @@
+# =============================================================================
+# TELEMEDICINE WEBRTC SIGNALING SERVER - PYTHON DEPENDENCIES
+# =============================================================================
+# Install with: pip install -r requirements.txt
+# =============================================================================
+
+# Flask - Web framework
+Flask==3.0.0
+
+# Flask-SocketIO - WebSocket support for real-time signaling
+Flask-SocketIO==5.3.6
+
+# Flask-CORS - Cross-Origin Resource Sharing for React frontend
+Flask-CORS==4.0.0
+
+# Python-SocketIO - Core Socket.IO library (required by Flask-SocketIO)
+python-socketio==5.10.0
+
+# Eventlet - Async networking library for production Socket.IO performance
+# Uncomment for production use:
+# eventlet==0.34.2
+
+# Gevent - Alternative async library for production
+# Uncomment for production use:
+# gevent==23.9.1
+# gevent-websocket==0.10.1
+
+# =============================================================================
+# OPTIONAL: For production deployment with Gunicorn
+# =============================================================================
+# gunicorn==21.2.0

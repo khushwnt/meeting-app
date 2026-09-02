@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(ipconfig)",
+      "Bash(npm install)",
+      "Bash(node *)",
+      "Bash(del *)",
+      "Bash(dir *)",
+      "Bash(generate-cert.bat)",
+      "Bash(python *)",
+      "Bash(start *)",
+      "Bash(netstat *)",
+      "Bash(findstr *)",
+      "Bash(taskkill *)"
+    ]
+  },
+  "$version": 3
+}
