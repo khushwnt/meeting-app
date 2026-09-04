@@ -96,8 +96,25 @@ async def auth_google(payload: dict):
         return JSONResponse({"detail": "idToken is required"}, status_code=400)
     try:
         user = auth.verify_google_id_token(id_token)
-    except Exception:
-        logger.warning("✗ Google ID token verification failed")
+    except Exception as exc:
+        # Log *why* it failed (exception + unverified token claims) so a
+        # mismatch between the Google Cloud client and GOOGLE_CLIENT_ID is
+        # visible in the Render logs. No secrets are logged: the client ID
+        # is public (it's embedded in the frontend).
+        try:
+            import jwt as pyjwt
+
+            claims = pyjwt.decode(id_token, options={"verify_signature": False})
+            logger.warning(
+                "✗ Google ID token verification failed: %s "
+                "(token aud=%s iss=%s, configured GOOGLE_CLIENT_ID=%s)",
+                exc,
+                claims.get("aud"),
+                claims.get("iss"),
+                config.GOOGLE_CLIENT_ID,
+            )
+        except Exception:
+            logger.warning(f"✗ Google ID token verification failed: {exc}")
         return JSONResponse({"detail": "Invalid Google credential"}, status_code=401)
     return JSONResponse(
         {"token": auth.create_session_token(user), "user": auth.public_profile(user)}
