@@ -42,6 +42,13 @@ REDIS_URL = os.environ.get("REDIS_URL", "")
 
 MAX_PARTICIPANTS_PER_ROOM = int(os.environ.get("MAX_PARTICIPANTS_PER_ROOM", "50"))
 
+# Auth (Google OAuth). If GOOGLE_CLIENT_ID is unset, anyone can join as a
+# guest with a typed name (local dev). Set it to require Google sign-in.
+# REQUIRE_AUTH: "auto" (default) = required iff GOOGLE_CLIENT_ID is set.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-change-me")
+REQUIRE_AUTH = os.environ.get("REQUIRE_AUTH", "auto")
+
 # Chat limits
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "100"))
 MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "2000"))

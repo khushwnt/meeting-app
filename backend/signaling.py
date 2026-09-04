@@ -17,9 +17,11 @@ import uuid
 import socketio
 
 try:
+    from backend import auth
     from backend import config
     from backend.rooms import store
 except ImportError:  # allow `cd backend && python main.py`
+    import auth
     import config
     from rooms import store
 
@@ -59,13 +61,22 @@ async def _broadcast_users(room_id: str) -> None:
 # =============================================================================
 
 @sio.event
-async def connect(sid, environ):
-    logger.info(f"✓ Client connected: {sid}")
+async def connect(sid, environ, auth_data=None):
+    if auth.is_auth_required():
+        user = auth.verify_session_token(auth.extract_token(environ, auth_data))
+        if user is None:
+            logger.warning(f"✗ Rejected unauthenticated client: {sid}")
+            return False
+        auth.sid_users[sid] = user
+        logger.info(f"✓ Client connected: {sid} ({user.get('name')})")
+    else:
+        logger.info(f"✓ Client connected (guest mode): {sid}")
 
 
 @sio.event
 async def disconnect(sid):
     logger.info(f"✗ Client disconnected: {sid}")
+    auth.sid_users.pop(sid, None)
 
     session = await store.get_session(sid)
     if session:
@@ -91,7 +102,18 @@ async def disconnect(sid):
 @sio.on("join-room")
 async def handle_join_room(sid, data):
     room_id = str((data or {}).get("roomId") or "").strip()[:64]
-    username = _clean_username((data or {}).get("username"))
+
+    # Verified Google identity wins; typed name only in guest mode.
+    verified = auth.sid_users.get(sid)
+    if auth.is_auth_required():
+        if verified is None:
+            await sio.emit("error", {"message": "Sign in required"}, to=sid)
+            return
+        username = verified.get("name", "Anonymous")
+        picture = verified.get("picture", "")
+    else:
+        username = _clean_username((data or {}).get("username"))
+        picture = ""
 
     if not room_id:
         await sio.emit("error", {"message": "Room name is required"}, to=sid)
@@ -109,7 +131,7 @@ async def handle_join_room(sid, data):
         return
 
     await sio.enter_room(sid, room_id)
-    await store.add_participant(room_id, sid, username)
+    await store.add_participant(room_id, sid, username, picture)
 
     count = await store.get_room_participant_count(room_id)
     logger.info(f"✓ User '{username}' joined room {room_id} ({count} online)")

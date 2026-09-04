@@ -20,10 +20,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 try:
+    from backend import auth
     from backend import config
     from backend.rooms import store
     from backend.signaling import sio
 except ImportError:  # allow `cd backend && python main.py`
+    import auth
     import config
     from rooms import store
     from signaling import sio
@@ -68,6 +70,38 @@ async def list_active_rooms():
     Only rooms with at least one participant are listed.
     """
     return JSONResponse({"rooms": await store.list_rooms()})
+
+
+@app.get("/api/auth/config")
+async def auth_config():
+    """Tell the frontend whether Google sign-in is required + which client id."""
+    return JSONResponse(
+        {
+            "authRequired": auth.is_auth_required(),
+            "googleClientId": config.GOOGLE_CLIENT_ID,
+        }
+    )
+
+
+@app.post("/api/auth/google")
+async def auth_google(payload: dict):
+    """Exchange a Google ID token for our session JWT.
+
+    Body: {"idToken": "..."} → {"token": "...", "user": {"name","email","picture"}}
+    """
+    if not config.GOOGLE_CLIENT_ID:
+        return JSONResponse({"detail": "Google sign-in is not configured"}, status_code=501)
+    id_token = (payload or {}).get("idToken", "")
+    if not id_token:
+        return JSONResponse({"detail": "idToken is required"}, status_code=400)
+    try:
+        user = auth.verify_google_id_token(id_token)
+    except Exception:
+        logger.warning("✗ Google ID token verification failed")
+        return JSONResponse({"detail": "Invalid Google credential"}, status_code=401)
+    return JSONResponse(
+        {"token": auth.create_session_token(user), "user": auth.public_profile(user)}
+    )
 
 
 @app.get("/debug/rooms")

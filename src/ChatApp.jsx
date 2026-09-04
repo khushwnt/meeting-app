@@ -79,6 +79,18 @@ const ChatApp = () => {
   const [availableRooms, setAvailableRooms] = useState([]);
   const [roomsLoading, setRoomsLoading] = useState(false);
 
+  // Auth state (Google OAuth; guest name fallback when server allows it)
+  const [authRequired, setAuthRequired] = useState(null); // null = loading
+  const [googleClientId, setGoogleClientId] = useState('');
+  const [authUser, setAuthUser] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('chat-user') || 'null');
+    } catch {
+      return null;
+    }
+  });
+  const googleButtonRef = useRef(null);
+
   // Room state
   const [joined, setJoined] = useState(false);
   const [joining, setJoining] = useState(false);
@@ -124,6 +136,51 @@ const ChatApp = () => {
     return () => clearInterval(timer);
   }, [joined]);
 
+  // Ask the backend whether Google sign-in is required (+ client id).
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/api/auth/config`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!data) return;
+        setAuthRequired(Boolean(data.authRequired));
+        setGoogleClientId(data.googleClientId || '');
+      })
+      .catch(() => {
+        // Backend unreachable — leave auth undecided; join will surface the error.
+      });
+  }, [joined]);
+
+  // Render the Google sign-in button once GIS + client id are ready.
+  useEffect(() => {
+    if (joined || !authRequired || !googleClientId) return;
+    let attempts = 0;
+    const timer = setInterval(() => {
+      attempts += 1;
+      if (window.google?.accounts?.id) {
+        clearInterval(timer);
+        try {
+          window.google.accounts.id.initialize({
+            client_id: googleClientId,
+            callback: handleGoogleCredential
+          });
+          if (googleButtonRef.current) {
+            googleButtonRef.current.innerHTML = '';
+            window.google.accounts.id.renderButton(googleButtonRef.current, {
+              theme: 'filled_blue',
+              size: 'large',
+              width: 280
+            });
+          }
+        } catch {
+          /* GIS unavailable */
+        }
+      } else if (attempts > 40) {
+        clearInterval(timer);
+      }
+    }, 250);
+    return () => clearInterval(timer);
+  }, [joined, authRequired, googleClientId, authUser]);
+
   // Auto-scroll to latest message
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -149,7 +206,23 @@ const ChatApp = () => {
 
   const addMessage = (msg) => {
     const full = withAudioUrl(msg);
-    setMessages((prev) => (prev.some((m) => m.id === full.id) ? prev : [...prev, full]));
+    setMessages((prev) => {
+      const idx = prev.findIndex((m) => m.id === full.id);
+      if (idx === -1) return [...prev, full];
+      // Server echo of our own optimistic message: replace it so the
+      // `pending` flag clears and the server timestamp/stamp applies.
+      const next = [...prev];
+      const oldUrl = next[idx].audioUrl;
+      next[idx] = { ...full, audioUrl: next[idx].audioUrl || full.audioUrl };
+      if (oldUrl && oldUrl !== next[idx].audioUrl && oldUrl.startsWith('blob:')) {
+        try {
+          URL.revokeObjectURL(oldUrl);
+        } catch {
+          /* ignore */
+        }
+      }
+      return next;
+    });
   };
 
   const flagTyping = (name) => {
@@ -161,11 +234,43 @@ const ChatApp = () => {
   };
 
   // ------------------------------------------------------------------
+  // Google sign-in
+  // ------------------------------------------------------------------
+  const handleGoogleCredential = async (response) => {
+    setError('');
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/auth/google`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: response.credential })
+      });
+      if (!res.ok) throw new Error('verification failed');
+      const data = await res.json();
+      localStorage.setItem('chat-token', data.token);
+      localStorage.setItem('chat-user', JSON.stringify(data.user));
+      setAuthUser(data.user);
+    } catch {
+      setError('Google sign-in failed. Try again.');
+    }
+  };
+
+  const signOut = () => {
+    leave();
+    localStorage.removeItem('chat-token');
+    localStorage.removeItem('chat-user');
+    setAuthUser(null);
+  };
+
+  // ------------------------------------------------------------------
   // Join / leave
   // ------------------------------------------------------------------
   const join = (e) => {
     if (e) e.preventDefault();
-    const name = (username || '').trim().slice(0, 32) || 'Anonymous';
+    if (authRequired && !authUser) {
+      setError('Please sign in with Google first.');
+      return;
+    }
+    const name = authUser?.name || (username || '').trim().slice(0, 32) || 'Anonymous';
     const targetRoom = (roomId || '').trim() || 'lounge';
     setUsername(name);
     localStorage.setItem('chat-username', name);
@@ -179,7 +284,8 @@ const ChatApp = () => {
       reconnection: true,
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
-      timeout: 10000
+      timeout: 10000,
+      auth: authUser ? { token: localStorage.getItem('chat-token') || '' } : undefined
     });
     socketRef.current = socket;
 
@@ -187,8 +293,17 @@ const ChatApp = () => {
       socket.emit('join-room', { roomId: targetRoom, username: name });
     });
 
-    socket.on('connect_error', () => {
-      setError('Could not connect to the chat server. Check your connection and try again.');
+    socket.on('connect_error', (err) => {
+      const msg = String(err?.message || '');
+      if (msg.includes('rejected') || msg.includes('unauthorized')) {
+        // Session token expired/revoked — force re-sign-in.
+        localStorage.removeItem('chat-token');
+        localStorage.removeItem('chat-user');
+        setAuthUser(null);
+        setError('Your session expired. Please sign in again.');
+      } else {
+        setError('Could not connect to the chat server. Check your connection and try again.');
+      }
       setJoining(false);
     });
 
@@ -353,19 +468,54 @@ const ChatApp = () => {
           </div>
 
           <form onSubmit={join} className="p-6 space-y-4">
-            <div>
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">
-                Your name
-              </label>
-              <input
-                type="text"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="e.g. Alex"
-                maxLength={32}
-                className="w-full px-3 py-2 bg-[#202c33] border border-[#2a3942] rounded-lg text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-600"
-              />
-            </div>
+            {authRequired ? (
+              authUser ? (
+                <div className="flex items-center gap-3 bg-[#202c33] border border-[#2a3942] rounded-lg px-3 py-2">
+                  {authUser.picture && (
+                    <img
+                      src={authUser.picture}
+                      alt={authUser.name}
+                      className="w-9 h-9 rounded-full"
+                      referrerPolicy="no-referrer"
+                    />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-slate-100 truncate">{authUser.name}</p>
+                    <p className="text-xs text-slate-400 truncate">{authUser.email}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={signOut}
+                    className="text-xs text-slate-400 hover:text-slate-200 flex-shrink-0"
+                  >
+                    Switch
+                  </button>
+                </div>
+              ) : (
+                <div>
+                  <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2 text-center">
+                    Sign in to join
+                  </p>
+                  <div ref={googleButtonRef} className="flex justify-center min-h-[44px]" />
+                </div>
+              )
+            ) : authRequired === false ? (
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">
+                  Your name
+                </label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="e.g. Alex"
+                  maxLength={32}
+                  className="w-full px-3 py-2 bg-[#202c33] border border-[#2a3942] rounded-lg text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-600"
+                />
+              </div>
+            ) : (
+              <p className="text-sm text-slate-500 text-center">Loading…</p>
+            )}
 
             <div>
               <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wide mb-1">
@@ -440,7 +590,7 @@ const ChatApp = () => {
 
             <button
               type="submit"
-              disabled={joining}
+              disabled={joining || (authRequired && !authUser)}
               className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-600 text-white font-semibold rounded-lg transition-colors"
             >
               {joining ? 'Joining…' : 'Join Room'}
@@ -454,7 +604,7 @@ const ChatApp = () => {
   // ------------------------------------------------------------------
   // CHAT ROOM
   // ------------------------------------------------------------------
-  const myName = (username || 'Anonymous').trim() || 'Anonymous';
+  const myName = authUser?.name || (username || 'Anonymous').trim() || 'Anonymous';
 
   return (
     <div className="h-screen w-full bg-[#0b141a] flex flex-col font-sans">
@@ -468,14 +618,34 @@ const ChatApp = () => {
               : 'Connecting…'}
           </p>
         </div>
-        <button
-          onClick={leave}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2a3942] hover:bg-[#374045] text-sm"
-          title="Leave room"
-        >
-          <LogOut size={16} />
-          Leave
-        </button>
+        <div className="flex items-center gap-2 flex-shrink-0">
+          {authUser?.picture && (
+            <img
+              src={authUser.picture}
+              alt={authUser.name}
+              title={authUser.name}
+              className="w-8 h-8 rounded-full"
+              referrerPolicy="no-referrer"
+            />
+          )}
+          {authUser && (
+            <button
+              onClick={signOut}
+              className="px-3 py-1.5 rounded-lg bg-[#2a3942] hover:bg-[#374045] text-sm"
+              title="Sign out"
+            >
+              Sign out
+            </button>
+          )}
+          <button
+            onClick={leave}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#2a3942] hover:bg-[#374045] text-sm"
+            title="Leave room"
+          >
+            <LogOut size={16} />
+            Leave
+          </button>
+        </div>
       </header>
 
       {notice && (
@@ -498,6 +668,9 @@ const ChatApp = () => {
         )}
         {messages.map((msg) => {
           const own = msg.sender === myName;
+          const senderPic = !own
+            ? users.find((u) => u.username === msg.sender)?.picture
+            : null;
           return (
             <div key={msg.id} className={`flex ${own ? 'justify-end' : 'justify-start'}`}>
               <div
@@ -506,7 +679,17 @@ const ChatApp = () => {
                 }`}
               >
                 {!own && (
-                  <p className="text-xs font-semibold text-emerald-400 mb-0.5">{msg.sender}</p>
+                  <p className="text-xs font-semibold text-emerald-400 mb-0.5 flex items-center gap-1.5">
+                    {senderPic && (
+                      <img
+                        src={senderPic}
+                        alt={msg.sender}
+                        className="w-4 h-4 rounded-full"
+                        referrerPolicy="no-referrer"
+                      />
+                    )}
+                    {msg.sender}
+                  </p>
                 )}
                 {msg.type === 'voice' ? (
                   <VoiceNote audioUrl={msg.audioUrl} duration={msg.duration} own={own} />

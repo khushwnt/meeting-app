@@ -70,6 +70,32 @@ Import repo (Vite preset) → env var
 
 > Render free sleeps when idle — first load after inactivity takes ~1 min.
 
+## Google sign-in (OAuth)
+
+No passwords to manage: users click **Sign in with Google**, the backend
+verifies the Google ID token and issues its own session JWT, and the chat
+socket connects with that token. Display names and avatars then come from the
+verified Google profile — clients can't spoof them. Without a client ID
+configured, the app runs in guest mode (typed display name, local dev).
+
+Setup (one time):
+
+1. [console.cloud.google.com](https://console.cloud.google.com) → create/select
+   a project → **APIs & Services → Credentials** → **Create Credentials →
+   OAuth client ID** → type **Web application**.
+2. Under **Authorized JavaScript origins** add (exact, no trailing slash):
+   - `https://<your-vercel-app>`
+   - `http://localhost:5173` (local dev)
+3. Copy the **Client ID**.
+4. On Render → service → Environment:
+   - `GOOGLE_CLIENT_ID` → the client ID
+   - `SECRET_KEY` → random 32-byte hex:
+     `python -c "import secrets; print(secrets.token_hex(32))"`
+5. On Vercel → project → Environment Variables: nothing new — the frontend
+   reads the client ID from `GET /api/auth/config` automatically.
+6. Redeploy both services. The lobby will now show the Google button; signed-in
+   users get their avatar in the header and on their messages.
+
 ## Project structure
 
 ```

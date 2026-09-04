@@ -56,14 +56,21 @@ class MemoryStore:
         for sid in self.room_participants.get(room_id, []):
             session = self.user_sessions.get(sid)
             if session:
-                users.append({"username": session.get("username", "Anonymous")})
+                users.append(
+                    {
+                        "username": session.get("username", "Anonymous"),
+                        "picture": session.get("picture", ""),
+                    }
+                )
         return sorted(users, key=lambda u: u["username"].lower())
 
-    async def add_participant(self, room_id: str, sid: str, username: str) -> None:
+    async def add_participant(
+        self, room_id: str, sid: str, username: str, picture: str = ""
+    ) -> None:
         self.room_participants.setdefault(room_id, [])
         if sid not in self.room_participants[room_id]:
             self.room_participants[room_id].append(sid)
-        self.user_sessions[sid] = {"roomId": room_id, "username": username}
+        self.user_sessions[sid] = {"roomId": room_id, "username": username, "picture": picture}
 
     async def remove_participant(self, sid: str) -> dict | None:
         session = self.user_sessions.pop(sid, None)
@@ -124,7 +131,11 @@ class RedisStore:
         data = await self._redis.hgetall(self._session_key(sid))
         if not data:
             return None
-        return {"roomId": data.get("roomId", ""), "username": data.get("username", "Anonymous")}
+        return {
+            "roomId": data.get("roomId", ""),
+            "username": data.get("username", "Anonymous"),
+            "picture": data.get("picture", ""),
+        }
 
     async def get_other_participant_in_room(self, room_id: str, current_sid: str) -> str | None:
         members = await self._redis.smembers(self._room_key(room_id))
@@ -142,17 +153,27 @@ class RedisStore:
         for sid in members:
             session = await self.get_session(sid)
             if session:
-                users.append({"username": session.get("username", "Anonymous")})
+                users.append(
+                    {
+                        "username": session.get("username", "Anonymous"),
+                        "picture": session.get("picture", ""),
+                    }
+                )
         return sorted(users, key=lambda u: u["username"].lower())
 
-    async def add_participant(self, room_id: str, sid: str, username: str) -> None:
+    async def add_participant(
+        self, room_id: str, sid: str, username: str, picture: str = ""
+    ) -> None:
         room_key = self._room_key(room_id)
         session_key = self._session_key(sid)
         async with self._redis.pipeline() as pipe:
             pipe.sadd(room_key, sid)
             pipe.expire(room_key, SESSION_TTL_SECONDS)
             pipe.sadd(ROOMS_INDEX_KEY, room_id)
-            pipe.hset(session_key, mapping={"roomId": room_id, "username": username})
+            pipe.hset(
+                session_key,
+                mapping={"roomId": room_id, "username": username, "picture": picture},
+            )
             pipe.expire(session_key, SESSION_TTL_SECONDS)
             await pipe.execute()
 
