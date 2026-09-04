@@ -1,11 +1,13 @@
 """
-Generate Self-Signed SSL Certificate for Flask Backend
+Generate Self-Signed SSL Certificate for FastAPI Backend
 Uses Python's cryptography package (no OpenSSL CLI required)
 
 USAGE:
-    python generate-cert.py
+    python backend/generate-cert.py
+    cd backend && python generate-cert.py
 """
 
+import ipaddress
 import os
 import socket
 from datetime import datetime, timedelta, timezone
@@ -175,11 +177,10 @@ def generate_certificate():
     print("  - 127.0.0.1")
     for ip in local_ips:
         print(f"  - {ip}")
-    print("\nYou can now run: python app.py --ssl")
+    print("\nYou can now run: python -m backend.main --ssl")
     print("Then access via: https://YOUR-IP:5000\n")
     print("NOTE: Your browser will show a security warning for self-signed certificates.")
     print("      Click 'Proceed' or 'Accept Risk' to continue.\n")
 
 if __name__ == '__main__':
-    import ipaddress
     generate_certificate()

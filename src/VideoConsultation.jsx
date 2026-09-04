@@ -6,7 +6,6 @@ import {
   VideoOff,
   PhoneOff,
   User,
-  Settings,
   MonitorPlay,
   CheckCircle2,
   WifiOff,
@@ -21,7 +20,7 @@ import { io } from 'socket.io-client';
  * =============================================================================
  *
  * This component handles:
- * 1. Socket.IO connection to the Flask-SocketIO signaling server
+ * 1. Socket.IO connection to the FastAPI signaling server
  * 2. WebRTC PeerConnection for peer-to-peer video/audio streaming
  * 3. Room management (join/leave)
  * 4. Media state broadcasting (mic/video toggle)
@@ -64,34 +63,26 @@ import { io } from 'socket.io-client';
  * =============================================================================
  */
 
-// Socket.IO server URL
-// IMPORTANT: Match the protocol to your backend (http for HTTP, https for HTTPS)
-// The backend IP should match your frontend's IP address
+// Backend base URL (REST + Socket.IO live on the same server).
+// Priority: VITE_SOCKET_URL env var (Vercel/Render deploys) → local dev fallback.
+const getBackendUrl = () => {
+  const envUrl = import.meta.env.VITE_SOCKET_URL;
+  if (envUrl) return envUrl.replace(/\/$/, '');
 
-// For network testing - use the SAME IP as your frontend
-const SOCKET_SERVER_URL = 'https://10.66.154.172:5000';
-
-// For localhost only (not for network):
-// const SOCKET_SERVER_URL = 'http://localhost:5000';
-
-// Auto-detect: Use the current window's hostname with port 5000
-// This ensures frontend and backend always use the same IP
-const getSocketUrl = () => {
   const currentHost = window.location.hostname;
-  const isHttps = window.location.protocol === 'https:';
-  const protocol = isHttps ? 'https' : 'http';
-  
-  // For localhost frontend, use localhost backend
+  const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
+
+  // Local dev: frontend on :5173, backend on :5000
   if (currentHost === 'localhost' || currentHost === '127.0.0.1') {
     return 'http://localhost:5000';
   }
-  
-  // For network access, use the SAME IP as the frontend
+
+  // Same-host fallback (LAN testing): backend shares the frontend's host
   return `${protocol}://${currentHost}:5000`;
 };
 
 // Use auto-detected URL (recommended) or override with constant above
-const ACTIVE_SOCKET_URL = getSocketUrl();
+const ACTIVE_SOCKET_URL = getBackendUrl();
 
 const VideoConsultation = () => {
   // =============================================================================
@@ -120,6 +111,15 @@ const VideoConsultation = () => {
   const [error, setError] = useState('');
   const [connectionError, setConnectionError] = useState('');
   const [mediaError, setMediaError] = useState('');
+  const [notice, setNotice] = useState('');
+
+  // Room selection (lobby)
+  const [roomId, setRoomId] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('room') || 'DEMO-ROOM-123';
+  });
+  const [availableRooms, setAvailableRooms] = useState([]);
+  const [roomsLoading, setRoomsLoading] = useState(false);
 
   // =============================================================================
   // REFS (Mutable values that don't trigger re-renders)
@@ -142,9 +142,28 @@ const VideoConsultation = () => {
   // CONFIGURATION
   // =============================================================================
 
-  // Get room ID from URL params (e.g., ?room=CONSULT-123)
-  const urlParams = new URLSearchParams(window.location.search);
-  const roomId = urlParams.get('room') || 'DEMO-ROOM-123';
+  // Fetch the list of active rooms for the lobby picker.
+  const fetchRooms = async () => {
+    setRoomsLoading(true);
+    try {
+      const res = await fetch(`${ACTIVE_SOCKET_URL}/api/rooms`);
+      if (!res.ok) throw new Error('bad status');
+      const data = await res.json();
+      setAvailableRooms(Array.isArray(data.rooms) ? data.rooms : []);
+    } catch {
+      setAvailableRooms([]);
+    } finally {
+      setRoomsLoading(false);
+    }
+  };
+
+  // Refresh the room list while waiting in the lobby.
+  useEffect(() => {
+    if (inCall) return;
+    fetchRooms();
+    const timer = setInterval(fetchRooms, 5000);
+    return () => clearInterval(timer);
+  }, [inCall]);
 
   // Mock user info (in real app, get from auth context)
   const userInfo = {
@@ -176,7 +195,6 @@ const VideoConsultation = () => {
    */
   const initializeMedia = async () => {
     if (mediaInitialized) {
-      console.log('→ Media already initialized');
       return { success: true };
     }
 
@@ -186,7 +204,6 @@ const VideoConsultation = () => {
     try {
       // Check for secure context (HTTPS)
       if (!window.isSecureContext) {
-        console.warn('⚠ Not a secure context. getUserMedia may fail.');
         // Continue anyway - some browsers allow localhost
       }
 
@@ -211,11 +228,9 @@ const VideoConsultation = () => {
       setStream(mediaStream);
       setMediaInitialized(true);
       setMediaLoading(false);
-      console.log('✓ Media stream initialized:', mediaStream);
       return { success: true };
 
     } catch (err) {
-      console.error('✗ Error accessing media devices:', err);
       setMediaLoading(false);
 
       // Handle specific error types
@@ -246,7 +261,6 @@ const VideoConsultation = () => {
    */
   useEffect(() => {
     return () => {
-      console.log('Cleaning up media stream...');
       if (stream) {
         stream.getTracks().forEach(track => track.stop());
       }
@@ -269,7 +283,6 @@ const VideoConsultation = () => {
   useEffect(() => {
     if (localVideoRef.current && stream) {
       localVideoRef.current.srcObject = stream;
-      console.log('✓ Local video attached to element');
     }
   }, [inCall, stream, videoEnabled]);
 
@@ -279,22 +292,19 @@ const VideoConsultation = () => {
 
   /**
    * Initialize Socket.IO connection
-   * This connects to the Flask-SocketIO signaling server
+   * This connects to the FastAPI signaling server
    */
   const connectToSignalingServer = () => {
     return new Promise((resolve, reject) => {
       try {
-        console.log('→ Connecting to signaling server:', ACTIVE_SOCKET_URL);
         
         // Create Socket.IO connection
         const socket = io(ACTIVE_SOCKET_URL, {
-          transports: ['websocket', 'polling'], // Try WebSocket first, fallback to polling
+          transports: ['websocket', 'polling'],
           reconnection: true,
           reconnectionAttempts: 5,
           reconnectionDelay: 1000,
-          timeout: 10000,
-          // For HTTPS/WSS, rejectUnauthorized can help with self-signed certs
-          rejectUnauthorized: false  // Allow self-signed certificates
+          timeout: 10000
         });
 
         socketRef.current = socket;
@@ -305,7 +315,6 @@ const VideoConsultation = () => {
 
         // Connection established
         socket.on('connect', () => {
-          console.log('✓ Socket connected:', socket.id);
           setIsConnected(true);
           setConnectionError('');
           resolve(socket);
@@ -313,44 +322,26 @@ const VideoConsultation = () => {
 
         // Connection error
         socket.on('connect_error', (err) => {
-          console.error('✗ Socket connection error:', err);
-          console.error('✗ Failed to connect to:', ACTIVE_SOCKET_URL);
-          
-          let errorMsg = 'Could not connect to signaling server. ';
-          
-          // Provide specific help based on the error
-          if (err.message.includes('ECONNREFUSED') || err.message.includes('Failed to fetch')) {
-            errorMsg += 'Backend server is not running. Start Flask with: python app.py --ssl';
-          } else if (err.message.includes('certificate')) {
-            errorMsg += 'SSL certificate error. Make sure backend certificates are valid.';
-          } else if (window.location.protocol === 'http:' && ACTIVE_SOCKET_URL.startsWith('https')) {
-            errorMsg += 'Mixed content: Frontend is HTTP but backend is HTTPS. Use HTTPS for both.';
+          let errorMsg = 'Could not connect to the consultation server. ';
+
+          if (err && err.message && err.message.includes('certificate')) {
+            errorMsg += 'There is a problem with the secure connection. Please reload and try again.';
           } else {
-            errorMsg += 'Check that the backend is running and accessible at ' + ACTIVE_SOCKET_URL;
+            errorMsg += 'Please check your internet connection and try again.';
           }
-          
+
           setConnectionError(errorMsg);
           setIsConnected(false);
           reject(err);
         });
 
         // Successfully joined room
-        socket.on('room-joined', (data) => {
-          console.log('✓ Joined room:', data);
+        socket.on('room-joined', () => {
           setIsConnecting(false);
-          
-          // If we're the first participant, wait for someone else to join
-          if (data.isFirst) {
-            console.log('→ You are the first participant. Waiting for others...');
-          } else {
-            // If someone is already here, we should initiate the WebRTC handshake
-            console.log('→ Someone is already in the room. Starting handshake...');
-          }
         });
 
         // Another user joined the room
         socket.on('user-joined', (data) => {
-          console.log('→ Another user joined:', data);
           setHasRemoteParticipant(true);
           setRemoteParticipant({
             username: data.username,
@@ -360,39 +351,33 @@ const VideoConsultation = () => {
           
           // If we're already in the call, initiate WebRTC handshake
           if (inCall && peerConnectionRef.current) {
-            console.log('→ Creating offer for new participant...');
             createOffer();
           }
         });
 
         // Received WebRTC OFFER from peer
         socket.on('offer', async (data) => {
-          console.log('→ Received OFFER from:', data.fromUsername);
           await handleOffer(data.offer);
         });
 
         // Received WebRTC ANSWER from peer
         socket.on('answer', async (data) => {
-          console.log('→ Received ANSWER from:', data.fromUsername);
           await handleAnswer(data.answer);
         });
 
         // Received ICE candidate from peer
         socket.on('ice-candidate', async (data) => {
-          console.log('→ Received ICE candidate from:', data.from);
           await handleIceCandidate(data.candidate);
         });
 
         // Participant's media state changed (mic/video toggle)
         socket.on('media-state-changed', (data) => {
-          console.log('→ Remote media state changed:', data);
           setRemoteMicEnabled(data.micEnabled);
           setRemoteVideoEnabled(data.videoEnabled);
         });
 
         // Received initial state of existing participant
         socket.on('participant-state', (data) => {
-          console.log('→ Received participant state:', data);
           setRemoteParticipant(prev => ({
             ...prev,
             username: data.username
@@ -403,7 +388,6 @@ const VideoConsultation = () => {
 
         // Participant left the room
         socket.on('participant-left', (data) => {
-          console.log('→ Participant left:', data);
           setHasRemoteParticipant(false);
           setRemoteParticipant(null);
           
@@ -419,37 +403,32 @@ const VideoConsultation = () => {
             peerConnectionInitialized.current = false;
           }
           
-          alert(`${data.leftUser} has ${data.reason === 'disconnected' ? 'disconnected' : 'left'} the consultation.`);
+          setNotice(`${data.leftUser} has ${data.reason === 'disconnected' ? 'disconnected' : 'left'} the consultation.`);
         });
 
         // Room is full (max 2 participants)
         socket.on('room-full', (data) => {
-          console.warn('✗ Room is full:', data.message);
           setError(data.message);
           setIsConnecting(false);
         });
 
         // Generic error from server
         socket.on('error', (data) => {
-          console.error('✗ Server error:', data);
           setError(data.message);
         });
 
         // Disconnection handler
         socket.on('disconnect', () => {
-          console.log('✗ Disconnected from signaling server');
           setIsConnected(false);
         });
 
         // Connection timeout
         socket.on('connect_timeout', () => {
-          console.error('✗ Connection timeout');
           setConnectionError('Connection timed out. Please check your network.');
           setIsConnecting(false);
         });
 
       } catch (err) {
-        console.error('✗ Failed to create socket connection:', err);
         reject(err);
       }
     });
@@ -466,11 +445,9 @@ const VideoConsultation = () => {
   const createPeerConnection = () => {
     // Don't create multiple peer connections
     if (peerConnectionInitialized.current) {
-      console.log('→ Peer connection already initialized');
       return peerConnectionRef.current;
     }
 
-    console.log('Creating RTCPeerConnection...');
 
     // Create new PeerConnection with ICE server config
     const pc = new RTCPeerConnection(rtcConfig);
@@ -486,19 +463,15 @@ const VideoConsultation = () => {
      * Tracks the connection status (connecting, connected, disconnected, failed)
      */
     pc.oniceconnectionstatechange = () => {
-      console.log('→ ICE connection state:', pc.iceConnectionState);
       
       switch (pc.iceConnectionState) {
         case 'connected':
-          console.log('✓ WebRTC connection established!');
           break;
         case 'disconnected':
         case 'failed':
-          console.error('✗ WebRTC connection lost');
           setConnectionError('Connection lost. Please rejoin.');
           break;
         case 'closed':
-          console.log('→ WebRTC connection closed');
           break;
         default:
           break;
@@ -516,12 +489,9 @@ const VideoConsultation = () => {
      */
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log('→ Sending ICE candidate:', event.candidate);
         socketRef.current?.emit('ice-candidate', {
           candidate: event.candidate
         });
-      } else {
-        console.log('✓ All ICE candidates have been generated');
       }
     };
 
@@ -531,14 +501,12 @@ const VideoConsultation = () => {
      * This is how we receive the remote video stream!
      */
     pc.ontrack = (event) => {
-      console.log('→ Received remote track:', event.track.kind, event.streams[0]);
       
       const remoteStream = event.streams[0];
       
       // Attach remote stream to video element
       if (remoteVideoRef.current) {
         remoteVideoRef.current.srcObject = remoteStream;
-        console.log('✓ Remote video attached to element');
       }
       
       setHasRemoteParticipant(true);
@@ -549,7 +517,6 @@ const VideoConsultation = () => {
      * More detailed connection state tracking
      */
     pc.onconnectionstatechange = () => {
-      console.log('→ Connection state:', pc.connectionState);
     };
 
     /**
@@ -558,18 +525,14 @@ const VideoConsultation = () => {
      * (e.g., adding/removing tracks)
      */
     pc.onnegotiationneeded = async () => {
-      console.log('→ Negotiation needed');
       // In simple cases, we handle this manually via createOffer
     };
 
     // Add local media tracks to the peer connection
     if (stream) {
       stream.getTracks().forEach(track => {
-        console.log('→ Adding local track:', track.kind, track.label);
         pc.addTrack(track, stream);
       });
-    } else {
-      console.warn('⚠ No local stream available yet');
     }
 
     return pc;
@@ -584,7 +547,6 @@ const VideoConsultation = () => {
       const pc = createPeerConnection();
       if (!pc) return;
 
-      console.log('Creating OFFER...');
 
       // Create SDP offer (Session Description Protocol)
       const offer = await pc.createOffer({
@@ -594,16 +556,13 @@ const VideoConsultation = () => {
 
       // Set local description (our offer)
       await pc.setLocalDescription(offer);
-      console.log('✓ Local description set (OFFER)');
 
       // Send offer to remote peer via signaling server
       socketRef.current?.emit('offer', {
         offer: pc.localDescription
       });
-      console.log('→ OFFER sent to remote peer');
 
-    } catch (err) {
-      console.error('✗ Error creating offer:', err);
+    } catch {
       setError('Failed to initialize video call. Please try again.');
     }
   };
@@ -617,28 +576,22 @@ const VideoConsultation = () => {
       const pc = createPeerConnection();
       if (!pc) return;
 
-      console.log('Setting remote description (OFFER)...');
 
       // Set the remote description (their offer)
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
-      console.log('✓ Remote description set (OFFER)');
 
       // Create SDP answer
       const answer = await pc.createAnswer();
-      console.log('Creating ANSWER...');
 
       // Set local description (our answer)
       await pc.setLocalDescription(answer);
-      console.log('✓ Local description set (ANSWER)');
 
       // Send answer back to remote peer
       socketRef.current?.emit('answer', {
         answer: pc.localDescription
       });
-      console.log('→ ANSWER sent to remote peer');
 
-    } catch (err) {
-      console.error('✗ Error handling offer:', err);
+    } catch {
       setError('Failed to accept video call. Please try again.');
     }
   };
@@ -651,18 +604,14 @@ const VideoConsultation = () => {
     try {
       const pc = peerConnectionRef.current;
       if (!pc) {
-        console.error('✗ No peer connection to set answer');
         return;
       }
 
-      console.log('Setting remote description (ANSWER)...');
 
       // Set the remote description (their answer)
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
-      console.log('✓ Remote description set (ANSWER)');
 
-    } catch (err) {
-      console.error('✗ Error handling answer:', err);
+    } catch {
       setError('Failed to complete video call setup.');
     }
   };
@@ -672,19 +621,12 @@ const VideoConsultation = () => {
    * Called when we receive network info from the remote peer
    */
   const handleIceCandidate = async (candidate) => {
-    try {
-      const pc = peerConnectionRef.current;
-      if (!pc || !candidate) return;
+    const pc = peerConnectionRef.current;
+    if (!pc || !candidate) return;
 
-      console.log('Adding ICE candidate...');
-
-      // Add the remote ICE candidate to our peer connection
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      console.log('✓ ICE candidate added');
-
-    } catch (err) {
-      console.error('✗ Error adding ICE candidate:', err);
-    }
+    // Add the remote ICE candidate to our peer connection.
+    // Failures here are routine (e.g. duplicate candidates) and safe to ignore.
+    await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {});
   };
 
   // =============================================================================
@@ -702,25 +644,26 @@ const VideoConsultation = () => {
     try {
       setError('');
       setConnectionError('');
+      setNotice('');
+
+      const targetRoom = (roomId || '').trim() || 'DEMO-ROOM-123';
+      setRoomId(targetRoom);
 
       // Step 0: Initialize media FIRST (user gesture already happened via button click)
-      console.log('Initializing media devices...');
       const mediaResult = await initializeMedia();
       
       if (!mediaResult.success) {
         // Media initialization failed - show error but let user decide to continue
-        console.warn('⚠ Media initialization failed, but continuing with audio-only call...');
       }
 
       setIsConnecting(true);
-      console.log('Joining call in room:', roomId);
 
       // Step 1: Connect to signaling server
       const socket = await connectToSignalingServer();
 
       // Step 2: Join the room
       socket.emit('join-room', {
-        roomId: roomId,
+        roomId: targetRoom,
         username: userInfo.username,
         role: userInfo.role
       });
@@ -732,10 +675,8 @@ const VideoConsultation = () => {
       // The actual offer/answer exchange happens when another user joins
       createPeerConnection();
 
-      console.log('✓ Call joined successfully');
 
-    } catch (err) {
-      console.error('✗ Failed to join call:', err);
+    } catch {
       setError('Failed to connect to the consultation room.');
       setIsConnecting(false);
     }
@@ -745,7 +686,6 @@ const VideoConsultation = () => {
    * Leave the consultation room
    */
   const leaveCall = () => {
-    console.log('Leaving call...');
 
     // Notify server
     socketRef.current?.emit('leave-room', { roomId });
@@ -759,6 +699,7 @@ const VideoConsultation = () => {
 
     // Reset states
     setInCall(false);
+    setNotice('');
     setHasRemoteParticipant(false);
     setRemoteParticipant(null);
     setRemoteMicEnabled(true);
@@ -769,7 +710,6 @@ const VideoConsultation = () => {
       remoteVideoRef.current.srcObject = null;
     }
 
-    console.log('✓ Left call successfully');
   };
 
   /**
@@ -788,7 +728,6 @@ const VideoConsultation = () => {
           micEnabled: newState
         });
         
-        console.log('→ Microphone:', newState ? 'unmuted' : 'muted');
       }
     }
   };
@@ -809,7 +748,6 @@ const VideoConsultation = () => {
           videoEnabled: newState
         });
         
-        console.log('→ Camera:', newState ? 'on' : 'off');
       }
     }
   };
@@ -882,11 +820,70 @@ const VideoConsultation = () => {
 
           {/* Right Side - Join Info */}
           <div className="w-full md:w-2/5 p-8 flex flex-col justify-center">
-            <div className="mb-8">
+            <div className="mb-6">
               <h2 className="text-2xl font-bold text-slate-800 mb-2">Ready to join?</h2>
-              <p className="text-slate-500">
-                Appointment ID: <span className="font-mono text-blue-600 bg-blue-50 px-2 py-1 rounded">{roomId}</span>
+              <p className="text-slate-500 text-sm mb-3">
+                Enter a room name to start a new consultation, or pick an active room below.
               </p>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wide mb-1">
+                Room name
+              </label>
+              <input
+                type="text"
+                value={roomId}
+                onChange={(e) => setRoomId(e.target.value)}
+                placeholder="e.g. CONSULT-123"
+                maxLength={64}
+                className="w-full px-3 py-2 border border-slate-300 rounded-lg font-mono text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            {/* Active Rooms */}
+            <div className="mb-6">
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-xs font-semibold text-slate-600 uppercase tracking-wide">
+                  Active rooms
+                </p>
+                <button
+                  onClick={fetchRooms}
+                  disabled={roomsLoading}
+                  className="text-xs text-blue-600 hover:text-blue-800 disabled:text-slate-400"
+                >
+                  {roomsLoading ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+              {availableRooms.length === 0 ? (
+                <p className="text-sm text-slate-400">
+                  {roomsLoading ? 'Looking for active rooms…' : 'No active rooms right now. Enter a name above to start one.'}
+                </p>
+              ) : (
+                <ul className="space-y-2 max-h-40 overflow-y-auto">
+                  {availableRooms.map((room) => {
+                    const isFull = room.participants >= room.maxParticipants;
+                    const isSelected = room.roomId === roomId;
+                    return (
+                      <li key={room.roomId}>
+                        <button
+                          onClick={() => setRoomId(room.roomId)}
+                          disabled={isFull}
+                          className={`w-full flex items-center justify-between px-3 py-2 rounded-lg border text-sm transition ${
+                            isSelected
+                              ? 'border-blue-500 bg-blue-50 text-blue-800'
+                              : isFull
+                                ? 'border-slate-200 bg-slate-50 text-slate-400 cursor-not-allowed'
+                                : 'border-slate-200 bg-white text-slate-700 hover:border-blue-400 hover:bg-blue-50/50'
+                          }`}
+                        >
+                          <span className="font-mono truncate">{room.roomId}</span>
+                          <span className="text-xs ml-2 flex-shrink-0">
+                            {isFull ? 'Full' : `${room.participants}/${room.maxParticipants}`}
+                          </span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
             </div>
 
             {/* Media Error Display */}
@@ -897,13 +894,6 @@ const VideoConsultation = () => {
                   <div>
                     <p className="font-semibold mb-1">Camera/Microphone Issue</p>
                     <p>{mediaError}</p>
-                    {!window.isSecureContext && (
-                      <p className="mt-2 font-medium text-amber-900">
-                        💡 Tip: You are using HTTP. For camera access, use HTTPS:
-                        <br />
-                        <code className="bg-amber-100 px-2 py-1 rounded text-xs">https://localhost:5173</code>
-                      </p>
-                    )}
                   </div>
                 </div>
               </div>
@@ -986,19 +976,9 @@ const VideoConsultation = () => {
             {/* Secure Context Warning */}
             {!window.isSecureContext && (
               <p className="mt-4 text-xs text-amber-600 text-center bg-amber-50 p-2 rounded">
-                ⚠️ You are using HTTP. For full camera support on mobile devices, use HTTPS.
+                Camera access needs a secure (HTTPS) connection.
               </p>
             )}
-
-            {/* Connection Debug Info */}
-            <div className="mt-4 p-3 bg-slate-50 rounded text-xs text-slate-600 font-mono">
-              <p className="font-semibold mb-1">Connection Info:</p>
-              <p>Frontend: {window.location.protocol}//{window.location.hostname}:{window.location.port}</p>
-              <p>Backend: {ACTIVE_SOCKET_URL}</p>
-              <p className="mt-2 text-amber-600">
-                ⚠ Make sure backend is running: <code className="bg-slate-200 px-1">python app.py --ssl</code>
-              </p>
-            </div>
           </div>
         </div>
       </div>
@@ -1027,7 +1007,21 @@ const VideoConsultation = () => {
       <main className="flex-1 relative p-4 flex items-center justify-center">
         {/* Remote Video (Doctor/Patient) */}
         <div className="w-full h-full max-w-6xl max-h-full bg-slate-800 rounded-2xl overflow-hidden relative shadow-2xl border border-slate-700">
-          
+
+          {/* Notice Banner (e.g. participant left) */}
+          {notice && (
+            <div className="absolute top-4 left-1/2 transform -translate-x-1/2 z-20 bg-slate-900/90 backdrop-blur-sm px-4 py-2 rounded-lg text-white text-sm flex items-center gap-3">
+              <span>{notice}</span>
+              <button
+                onClick={() => setNotice('')}
+                className="text-slate-400 hover:text-white font-bold"
+                aria-label="Dismiss"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
           {/* Remote Video Element */}
           {hasRemoteParticipant && remoteVideoEnabled ? (
             <video

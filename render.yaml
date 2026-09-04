@@ -1,0 +1,17 @@
+# Render blueprint: backend on Render, frontend on Vercel.
+# Deploy via Render Dashboard → New → Blueprint → point at this repo.
+# Then set CORS_ORIGINS to your Vercel URL and REDIS_URL to your
+# Redis provider (e.g. Upstash free tier).
+
+services:
+  - type: web
+    name: telemedicine-signaling
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:socket_app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://your-app.vercel.app
+      - key: REDIS_URL
+        sync: false
