@@ -51,21 +51,25 @@ prefills the room input.
 2. Copy the **TLS** endpoint, e.g. `rediss://default:xxxx@xxx.upstash.io:6379`.
    This becomes your `REDIS_URL`.
 
-### 2. Backend — Render
+### 2. Backend — Render (Web Service inside a Project)
 
-Option A — Blueprint (uses `render.yaml` in this repo):
-
-1. Render Dashboard → New → **Blueprint** → select this repo.
-2. Set `CORS_ORIGINS` to your Vercel URL, e.g. `https://your-app.vercel.app`.
-3. Set `REDIS_URL` to your Upstash TLS endpoint.
+1. Render Dashboard → **New → Project** → name it (e.g. `telemedicine`) → Create.
+2. Inside the project → **New → Web Service** → connect GitHub → select this repo, branch `main`.
+3. Configure the service:
+   - **Name:** `telemedicine-signaling`
+   - **Region:** closest to your users (e.g. Singapore for India)
+   - **Runtime:** **Python 3** (change this manually — the repo's root
+     `package.json` can make Render pick Node instead)
+   - **Build Command:** `pip install -r backend/requirements.txt`
+   - **Start Command:** `uvicorn backend.main:socket_app --host 0.0.0.0 --port $PORT`
+   - **Health Check Path:** `/health`
+   - **Instance Type:** Free
+   - **Environment variables:**
+     - `CORS_ORIGINS` → `https://placeholder.vercel.app` for now (you'll
+       replace it with the real Vercel URL in step 4)
+     - `REDIS_URL` → your Upstash TLS endpoint (`rediss://...`)
+     - `PYTHON_VERSION` → `3.12.0`
 4. Deploy. Note the backend URL, e.g. `https://telemedicine-signaling.onrender.com`.
-
-Option B — manual web service:
-
-- Build command: `pip install -r backend/requirements.txt`
-- Start command: `uvicorn backend.main:socket_app --host 0.0.0.0 --port $PORT`
-- Health check path: `/health`
-- Env vars: `CORS_ORIGINS`, `REDIS_URL` (same values as above).
 
 ### 3. Frontend — Vercel
 
@@ -91,7 +95,6 @@ telemedicine-app/
 │   ├── VideoConsultation.jsx  # Lobby + video call UI, WebRTC, Socket.IO client
 │   ├── App.jsx
 │   └── main.jsx
-├── render.yaml           # Render blueprint for the backend
 └── .env.example          # All environment variables
 ```
 
