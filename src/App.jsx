@@ -1,14 +1,11 @@
 import React from 'react';
-import VideoConsultation from './VideoConsultation';
+import ChatApp from './ChatApp';
 
 /**
- * Main App Component
- * 
- * This is a wrapper that renders the VideoConsultation component.
- * All WebRTC and Socket.IO logic is in VideoConsultation.jsx
+ * Main App Component — meeting-room chat (text + voice notes, no auth).
  */
 const App = () => {
-  return <VideoConsultation />;
+  return <ChatApp />;
 };
 
 export default App;

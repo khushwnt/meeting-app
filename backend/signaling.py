@@ -1,12 +1,18 @@
-"""Socket.IO event handlers for WebRTC signaling.
+"""Socket.IO event handlers for the chat app.
 
-Event names and payloads match what the React frontend (socket.io-client)
-expects. Room state lives in ``backend.rooms.store`` (memory or Redis).
-When REDIS_URL is set, a Redis manager is attached so emits also reach
-clients connected to *other* server instances.
+No auth — anyone with a display name can join a room and chat.
+Text + voice-note messages are broadcast to the room and stored
+(memory, or Redis when REDIS_URL is set) so late joiners get history.
+
+Client → server: join-room, leave-room, chat-message, voice-message, typing
+Server → client: room-joined, user-joined, participant-left, room-users,
+                 chat-history, chat-message, voice-message, typing,
+                 room-full, error
 """
 
 import logging
+import time
+import uuid
 
 import socketio
 
@@ -24,6 +30,8 @@ def _create_server() -> socketio.AsyncServer:
     kwargs = {
         "async_mode": "asgi",
         "cors_allowed_origins": config.SOCKET_CORS_ORIGINS,
+        # Voice notes ride over the socket; allow payloads above the 1MB default.
+        "max_http_buffer_size": config.MAX_SOCKET_BUFFER_SIZE,
     }
     if config.REDIS_URL:
         try:
@@ -35,6 +43,15 @@ def _create_server() -> socketio.AsyncServer:
 
 
 sio = _create_server()
+
+
+def _clean_username(raw) -> str:
+    name = str(raw or "").strip()
+    return name[:32] if name else "Anonymous"
+
+
+async def _broadcast_users(room_id: str) -> None:
+    await sio.emit("room-users", {"users": await store.get_room_users(room_id)}, room=room_id)
 
 
 # =============================================================================
@@ -52,17 +69,14 @@ async def disconnect(sid):
 
     session = await store.get_session(sid)
     if session:
-        other_sid = await store.get_other_participant_in_room(session["roomId"], sid)
-        if other_sid:
-            await sio.emit(
-                "participant-left",
-                {"leftUser": session.get("username", "Participant"), "reason": "disconnected"},
-                to=other_sid,
-            )
-
-    removed = await store.remove_participant(sid)
-    if removed:
-        logger.info(f"→ Cleaned up session for room {removed['roomId']}")
+        room_id = session["roomId"]
+        await sio.emit(
+            "participant-left",
+            {"leftUser": session.get("username", "Anonymous"), "reason": "disconnected"},
+            room=room_id,
+        )
+        await store.remove_participant(sid)
+        await _broadcast_users(room_id)
 
     try:
         await sio.leave_room(sid, "*")
@@ -76,61 +90,43 @@ async def disconnect(sid):
 
 @sio.on("join-room")
 async def handle_join_room(sid, data):
-    room_id = (data or {}).get("roomId")
-    username = (data or {}).get("username", "Anonymous")
-    role = (data or {}).get("role", "participant")
+    room_id = str((data or {}).get("roomId") or "").strip()[:64]
+    username = _clean_username((data or {}).get("username"))
 
     if not room_id:
-        await sio.emit("error", {"message": "Room ID is required"}, to=sid)
+        await sio.emit("error", {"message": "Room name is required"}, to=sid)
         return
 
-    logger.info(f"→ User '{username}' ({role}) attempting to join room: {room_id}")
+    logger.info(f"→ User '{username}' attempting to join room: {room_id}")
 
     if await store.get_room_participant_count(room_id) >= config.MAX_PARTICIPANTS_PER_ROOM:
         logger.warning(f"✗ Room {room_id} is full. Rejecting {username}.")
         await sio.emit(
             "room-full",
-            {"message": "This consultation room is already full (max 2 participants)"},
+            {"message": "This room is full. Please try another one."},
             to=sid,
         )
         return
 
     await sio.enter_room(sid, room_id)
-    await store.add_participant(room_id, sid, username, role)
+    await store.add_participant(room_id, sid, username)
 
-    other_sid = await store.get_other_participant_in_room(room_id, sid)
-    is_first = other_sid is None
-
-    logger.info(f"✓ User '{username}' joined room {room_id}")
+    count = await store.get_room_participant_count(room_id)
+    logger.info(f"✓ User '{username}' joined room {room_id} ({count} online)")
 
     await sio.emit(
         "room-joined",
-        {
-            "roomId": room_id,
-            "username": username,
-            "role": role,
-            "isFirst": is_first,
-            "participantCount": await store.get_room_participant_count(room_id),
-        },
+        {"roomId": room_id, "username": username, "participantCount": count},
         to=sid,
     )
-
-    if other_sid:
-        await sio.emit(
-            "user-joined",
-            {"username": username, "role": role, "sid": sid},
-            to=other_sid,
-        )
-        other_user = (await store.get_session(other_sid)) or {}
-        await sio.emit(
-            "participant-state",
-            {
-                "username": other_user.get("username", "Participant"),
-                "micEnabled": other_user.get("micEnabled", True),
-                "videoEnabled": other_user.get("videoEnabled", True),
-            },
-            to=sid,
-        )
+    await sio.emit(
+        "user-joined",
+        {"username": username},
+        room=room_id,
+        skip_sid=sid,
+    )
+    await sio.emit("chat-history", {"messages": await store.get_history(room_id)}, to=sid)
+    await _broadcast_users(room_id)
 
 
 @sio.on("leave-room")
@@ -142,98 +138,89 @@ async def handle_leave_room(sid, data=None):
     room_id = (data or {}).get("roomId", session["roomId"]) if data else session["roomId"]
     username = session.get("username", "Anonymous")
 
-    other_sid = await store.get_other_participant_in_room(room_id, sid)
-    if other_sid:
-        await sio.emit(
-            "participant-left",
-            {"leftUser": username, "reason": "left-gracefully"},
-            to=other_sid,
-        )
-
+    await sio.emit(
+        "participant-left",
+        {"leftUser": username, "reason": "left"},
+        room=room_id,
+    )
     await sio.leave_room(sid, room_id)
     await store.remove_participant(sid)
+    await _broadcast_users(room_id)
 
 
 # =============================================================================
-# WEBRTC SIGNALING RELAY
+# CHAT MESSAGING
 # =============================================================================
 
-@sio.on("offer")
-async def handle_offer(sid, data):
+@sio.on("chat-message")
+async def handle_chat_message(sid, data):
     session = await store.get_session(sid)
     if not session:
-        logger.warning(f"✗ Offer received from user not in a room: {sid}")
+        await sio.emit("error", {"message": "Join a room first"}, to=sid)
         return
-    other_sid = await store.get_other_participant_in_room(session["roomId"], sid)
-    if not other_sid:
-        logger.warning(f"✗ No other participant to send offer to in room {session['roomId']}")
+
+    text = str((data or {}).get("text") or "").strip()
+    if not text:
+        return
+    text = text[: config.MAX_TEXT_LENGTH]
+
+    client_id = str((data or {}).get("id") or "")[:64]
+    message = {
+        "id": client_id or uuid.uuid4().hex,
+        "roomId": session["roomId"],
+        "sender": session.get("username", "Anonymous"),
+        "type": "text",
+        "text": text,
+        "timestamp": int(time.time() * 1000),
+    }
+    await store.add_message(session["roomId"], message)
+    await sio.emit("chat-message", message, room=session["roomId"])
+
+
+@sio.on("voice-message")
+async def handle_voice_message(sid, data):
+    session = await store.get_session(sid)
+    if not session:
+        await sio.emit("error", {"message": "Join a room first"}, to=sid)
+        return
+
+    audio = (data or {}).get("audio") or ""
+    mime_type = str((data or {}).get("mimeType") or "audio/webm")
+    try:
+        duration = float((data or {}).get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+
+    if not audio or len(audio) > config.MAX_VOICE_CHARS:
+        await sio.emit("error", {"message": "Voice note was rejected (empty or too long)"}, to=sid)
+        return
+
+    client_id = str((data or {}).get("id") or "")[:64]
+    message = {
+        "id": client_id or uuid.uuid4().hex,
+        "roomId": session["roomId"],
+        "sender": session.get("username", "Anonymous"),
+        "type": "voice",
+        "audio": audio,
+        "mimeType": mime_type[:64],
+        "duration": round(max(0, min(duration, 600)), 1),
+        "timestamp": int(time.time() * 1000),
+    }
+    await store.add_message(session["roomId"], message)
+    await sio.emit("voice-message", message, room=session["roomId"])
+
+
+@sio.on("typing")
+async def handle_typing(sid, data):
+    session = await store.get_session(sid)
+    if not session:
         return
     await sio.emit(
-        "offer",
+        "typing",
         {
-            "offer": (data or {}).get("offer"),
-            "from": sid,
-            "fromUsername": session.get("username", "Participant"),
+            "username": session.get("username", "Anonymous"),
+            "isTyping": bool((data or {}).get("isTyping")),
         },
-        to=other_sid,
+        room=session["roomId"],
+        skip_sid=sid,
     )
-
-
-@sio.on("answer")
-async def handle_answer(sid, data):
-    session = await store.get_session(sid)
-    if not session:
-        return
-    other_sid = await store.get_other_participant_in_room(session["roomId"], sid)
-    if not other_sid:
-        return
-    await sio.emit(
-        "answer",
-        {
-            "answer": (data or {}).get("answer"),
-            "from": sid,
-            "fromUsername": session.get("username", "Participant"),
-        },
-        to=other_sid,
-    )
-
-
-@sio.on("ice-candidate")
-async def handle_ice_candidate(sid, data):
-    session = await store.get_session(sid)
-    if not session:
-        return
-    other_sid = await store.get_other_participant_in_room(session["roomId"], sid)
-    if not other_sid:
-        return
-    await sio.emit(
-        "ice-candidate",
-        {"candidate": (data or {}).get("candidate"), "from": sid},
-        to=other_sid,
-    )
-
-
-# =============================================================================
-# MEDIA STATE BROADCASTING
-# =============================================================================
-
-@sio.on("media-state-change")
-async def handle_media_state_change(sid, data):
-    data = data or {}
-    updated = await store.update_media_state(
-        sid, data.get("micEnabled"), data.get("videoEnabled")
-    )
-    if updated is None:
-        return
-
-    other_sid = await store.get_other_participant_in_room(updated["roomId"], sid)
-    if other_sid:
-        await sio.emit(
-            "media-state-changed",
-            {
-                "username": updated.get("username", "Participant"),
-                "micEnabled": updated.get("micEnabled", True),
-                "videoEnabled": updated.get("videoEnabled", True),
-            },
-            to=other_sid,
-        )

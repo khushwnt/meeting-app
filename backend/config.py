@@ -40,6 +40,14 @@ SOCKET_CORS_ORIGINS = (
 # When unset, an in-memory store is used (single instance only).
 REDIS_URL = os.environ.get("REDIS_URL", "")
 
-MAX_PARTICIPANTS_PER_ROOM = int(os.environ.get("MAX_PARTICIPANTS_PER_ROOM", "2"))
+MAX_PARTICIPANTS_PER_ROOM = int(os.environ.get("MAX_PARTICIPANTS_PER_ROOM", "50"))
 
-TITLE = "Telemedicine WebRTC Signaling Server"
+# Chat limits
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "100"))
+MAX_TEXT_LENGTH = int(os.environ.get("MAX_TEXT_LENGTH", "2000"))
+# Max base64 voice-note payload (~1.3MB of audio after base64 inflation).
+MAX_VOICE_CHARS = int(os.environ.get("MAX_VOICE_CHARS", "2000000"))
+# Socket.IO payload ceiling must exceed the largest voice note.
+MAX_SOCKET_BUFFER_SIZE = int(os.environ.get("MAX_SOCKET_BUFFER_SIZE", "4000000"))
+
+TITLE = "Meeting Room Chat Server"

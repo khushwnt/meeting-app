@@ -1,15 +1,18 @@
-"""Room and session state with a pluggable backend.
+"""Room, session, and message state with a pluggable backend.
 
 - MemoryStore: in-memory dicts (single instance only, local dev default).
 - RedisStore: shared state via Redis (multi-instance safe, used when
-  REDIS_URL is set — e.g. Render + Upstash).
+  REDIS_URL is set — e.g. Render + Upstash). Doubles as free message
+  history storage (recent messages per room, capped + expiring).
 
 Redis schema (all keys prefixed with ``tele:``):
 - ``tele:rooms``            Set of active room ids
 - ``tele:room:{roomId}``    Set of participant sids in the room
-- ``tele:session:{sid}``    Hash {roomId, username, role, micEnabled, videoEnabled}
+- ``tele:session:{sid}``    Hash {roomId, username}
+- ``tele:history:{roomId}`` List of recent message JSON blobs (newest at tail)
 """
 
+import json
 import logging
 
 try:
@@ -20,16 +23,12 @@ except ImportError:  # allow `cd backend && python main.py`
 logger = logging.getLogger(__name__)
 
 SESSION_TTL_SECONDS = 24 * 60 * 60
+HISTORY_TTL_SECONDS = 7 * 24 * 60 * 60
 
 ROOM_KEY_PREFIX = "tele:room:"
 SESSION_KEY_PREFIX = "tele:session:"
+HISTORY_KEY_PREFIX = "tele:history:"
 ROOMS_INDEX_KEY = "tele:rooms"
-
-
-def _to_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).lower() in ("1", "true", "yes", "on")
 
 
 class MemoryStore:
@@ -38,6 +37,7 @@ class MemoryStore:
     def __init__(self):
         self.room_participants: dict[str, list[str]] = {}
         self.user_sessions: dict[str, dict] = {}
+        self.message_history: dict[str, list[dict]] = {}
 
     async def get_session(self, sid: str) -> dict | None:
         return self.user_sessions.get(sid)
@@ -51,17 +51,19 @@ class MemoryStore:
     async def get_room_participant_count(self, room_id: str) -> int:
         return len(self.room_participants.get(room_id, []))
 
-    async def add_participant(self, room_id: str, sid: str, username: str, role: str) -> None:
+    async def get_room_users(self, room_id: str) -> list[dict]:
+        users = []
+        for sid in self.room_participants.get(room_id, []):
+            session = self.user_sessions.get(sid)
+            if session:
+                users.append({"username": session.get("username", "Anonymous")})
+        return sorted(users, key=lambda u: u["username"].lower())
+
+    async def add_participant(self, room_id: str, sid: str, username: str) -> None:
         self.room_participants.setdefault(room_id, [])
         if sid not in self.room_participants[room_id]:
             self.room_participants[room_id].append(sid)
-        self.user_sessions[sid] = {
-            "roomId": room_id,
-            "username": username,
-            "role": role,
-            "micEnabled": True,
-            "videoEnabled": True,
-        }
+        self.user_sessions[sid] = {"roomId": room_id, "username": username}
 
     async def remove_participant(self, sid: str) -> dict | None:
         session = self.user_sessions.pop(sid, None)
@@ -74,17 +76,14 @@ class MemoryStore:
                 del self.room_participants[session["roomId"]]
         return session
 
-    async def update_media_state(
-        self, sid: str, mic_enabled: bool | None, video_enabled: bool | None
-    ) -> dict | None:
-        session = self.user_sessions.get(sid)
-        if session is None:
-            return None
-        if mic_enabled is not None:
-            session["micEnabled"] = mic_enabled
-        if video_enabled is not None:
-            session["videoEnabled"] = video_enabled
-        return session
+    async def add_message(self, room_id: str, message: dict) -> None:
+        history = self.message_history.setdefault(room_id, [])
+        history.append(message)
+        if len(history) > config.MAX_HISTORY:
+            del history[: -config.MAX_HISTORY]
+
+    async def get_history(self, room_id: str) -> list[dict]:
+        return list(self.message_history.get(room_id, []))
 
     async def list_rooms(self) -> list[dict]:
         return [
@@ -118,17 +117,14 @@ class RedisStore:
     def _session_key(self, sid: str) -> str:
         return f"{SESSION_KEY_PREFIX}{sid}"
 
+    def _history_key(self, room_id: str) -> str:
+        return f"{HISTORY_KEY_PREFIX}{room_id}"
+
     async def get_session(self, sid: str) -> dict | None:
         data = await self._redis.hgetall(self._session_key(sid))
         if not data:
             return None
-        return {
-            "roomId": data.get("roomId", ""),
-            "username": data.get("username", "Anonymous"),
-            "role": data.get("role", "participant"),
-            "micEnabled": _to_bool(data.get("micEnabled", "true")),
-            "videoEnabled": _to_bool(data.get("videoEnabled", "true")),
-        }
+        return {"roomId": data.get("roomId", ""), "username": data.get("username", "Anonymous")}
 
     async def get_other_participant_in_room(self, room_id: str, current_sid: str) -> str | None:
         members = await self._redis.smembers(self._room_key(room_id))
@@ -140,23 +136,23 @@ class RedisStore:
     async def get_room_participant_count(self, room_id: str) -> int:
         return await self._redis.scard(self._room_key(room_id))
 
-    async def add_participant(self, room_id: str, sid: str, username: str, role: str) -> None:
+    async def get_room_users(self, room_id: str) -> list[dict]:
+        members = await self._redis.smembers(self._room_key(room_id))
+        users = []
+        for sid in members:
+            session = await self.get_session(sid)
+            if session:
+                users.append({"username": session.get("username", "Anonymous")})
+        return sorted(users, key=lambda u: u["username"].lower())
+
+    async def add_participant(self, room_id: str, sid: str, username: str) -> None:
         room_key = self._room_key(room_id)
         session_key = self._session_key(sid)
         async with self._redis.pipeline() as pipe:
             pipe.sadd(room_key, sid)
             pipe.expire(room_key, SESSION_TTL_SECONDS)
             pipe.sadd(ROOMS_INDEX_KEY, room_id)
-            pipe.hset(
-                session_key,
-                mapping={
-                    "roomId": room_id,
-                    "username": username,
-                    "role": role,
-                    "micEnabled": "true",
-                    "videoEnabled": "true",
-                },
-            )
+            pipe.hset(session_key, mapping={"roomId": room_id, "username": username})
             pipe.expire(session_key, SESSION_TTL_SECONDS)
             await pipe.execute()
 
@@ -176,22 +172,23 @@ class RedisStore:
                 await pipe.execute()
         return session
 
-    async def update_media_state(
-        self, sid: str, mic_enabled: bool | None, video_enabled: bool | None
-    ) -> dict | None:
-        session = await self.get_session(sid)
-        if session is None:
-            return None
-        mapping = {}
-        if mic_enabled is not None:
-            session["micEnabled"] = mic_enabled
-            mapping["micEnabled"] = "true" if mic_enabled else "false"
-        if video_enabled is not None:
-            session["videoEnabled"] = "true" if video_enabled else "false"
-            session["videoEnabled"] = video_enabled
-        if mapping:
-            await self._redis.hset(self._session_key(sid), mapping=mapping)
-        return session
+    async def add_message(self, room_id: str, message: dict) -> None:
+        history_key = self._history_key(room_id)
+        async with self._redis.pipeline() as pipe:
+            pipe.rpush(history_key, json.dumps(message))
+            pipe.ltrim(history_key, -config.MAX_HISTORY, -1)
+            pipe.expire(history_key, HISTORY_TTL_SECONDS)
+            await pipe.execute()
+
+    async def get_history(self, room_id: str) -> list[dict]:
+        raw = await self._redis.lrange(self._history_key(room_id), 0, -1)
+        messages = []
+        for item in raw:
+            try:
+                messages.append(json.loads(item))
+            except (ValueError, TypeError):
+                continue
+        return messages
 
     async def list_rooms(self) -> list[dict]:
         rooms = []
@@ -209,7 +206,6 @@ class RedisStore:
 
     async def stats(self) -> dict:
         room_ids = await self._redis.smembers(ROOMS_INDEX_KEY)
-        # Session count via key scan (fine for signaling-scale keyspaces)
         session_count = 0
         async for _ in self._redis.scan_iter(f"{SESSION_KEY_PREFIX}*"):
             session_count += 1
