@@ -12,9 +12,15 @@ Render/Vercel-style hosting is configured:
 import os
 
 
+def _normalize_origin(origin: str) -> str:
+    # Browsers send `Origin` WITHOUT a trailing slash, so
+    # `https://app.vercel.app/` would never match. Strip it.
+    return origin.strip().rstrip("/")
+
+
 def _get_cors_origins() -> list[str]:
     raw = os.environ.get("CORS_ORIGINS", "*")
-    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    origins = [_normalize_origin(o) for o in raw.split(",") if o.strip()]
     return origins or ["*"]
 
 
@@ -23,8 +29,11 @@ PORT = int(os.environ.get("PORT", "5000"))
 
 # CORS: restrict in production, e.g. "https://your-app.vercel.app"
 CORS_ORIGINS = _get_cors_origins()
-SOCKET_CORS_ORIGINS = os.environ.get("SOCKET_CORS_ORIGINS") or (
-    CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*"
+_socket_cors_raw = os.environ.get("SOCKET_CORS_ORIGINS")
+SOCKET_CORS_ORIGINS = (
+    _normalize_origin(_socket_cors_raw)
+    if _socket_cors_raw
+    else (CORS_ORIGINS if CORS_ORIGINS != ["*"] else "*")
 )
 
 # When set, room state is shared via Redis (multi-instance safe).
